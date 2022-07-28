@@ -1,110 +1,551 @@
 /*
- * Copyright (c) 2016 Intel Corporation
+ * Copyright (c) 2017 Linaro Limited
  *
  * SPDX-License-Identifier: Apache-2.0
  */
-
-#include <zephyr/zephyr.h>
-#include <zephyr/drivers/gpio.h>
-#include <zephyr/drivers/spi.h>
-#include <zephyr/sys/printk.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include "em_eusart.h"
-#include "em_cmu.h"
+#include <stdint.h>
 
-#define SPI_DRV_NAME	DT_NODELABEL(eusart1)
-#define BUF_SIZE 36
-#define BUF2_SIZE 17
-#define TOTAL_TX_COUNT	2
-#define TOTAL_RX_COUNT	2
+#include <zephyr/zephyr.h>
+#include <zephyr/devicetree.h>
+#include <zephyr/sys/printk.h>
+#include <zephyr/logging/log.h>
+#include <zephyr/shell/shell.h>
+#include <zephyr/drivers/flash.h>
+#include <zephyr/device.h>
+#include <soc.h>
+#include <stdlib.h>
+#include "md.h"
+#include "aes.h"
+#include "aes_alt.h"
+#include "mbedtls_config_autogen.h"
+#include "sl_malloc.h"
 
-uint8_t buffer_tx[] = "Thequickbrownfoxjumpsoverthelazydog";
-uint8_t buffer_rx[BUF_SIZE] = {0};
+#define MODE_ENCRYPT                   (1)
+#define MODE_DECRYPT                   (2)
 
-uint8_t buffer2_tx[] = "0123456789abcdef\0";
-uint8_t buffer2_rx[BUF2_SIZE] = {};
+#define AES_BLOCK_SIZE                (16)
+#define IV_SIZE                       (16)
+#define TAG_SIZE                      (32)
+#define MAX_MESSAGE_SIZE_ENCRYPTION (1024)
+#define MAX_MESSAGE_SIZE_DECRYPTION \
+  (2 * MAX_MESSAGE_SIZE_ENCRYPTION + 2 * IV_SIZE + 2 * TAG_SIZE + 1)
 
+static char message[MAX_MESSAGE_SIZE_DECRYPTION];
 
-struct spi_gecko_config {
-	EUSART_TypeDef *base;
-	CMU_Clock_TypeDef clock;
-	struct soc_gpio_pin pin_rx;
-	struct soc_gpio_pin pin_tx;
-	struct soc_gpio_pin pin_clk;
-	struct soc_gpio_pin pin_cs;
-};
+static const char *key256bits = "603DEB10 15CA71BE 2B73AEF0 857D7781"
+                                "1F352C07 3B6108D7 2D9810A3 0914DFF4";
+                                
+int hextext2bin(uint8_t *binbuf, unsigned int binbuflen, const char *hexstr);
+void bin2hextext(char* hexstr, uint8_t* binbuf, unsigned int binbuflen);
+void app_aescrypt_process_action(void);
 
-struct spi_config spi_cfg = {
-	.frequency = 1000000,
-	.operation = SPI_OP_MODE_MASTER | SPI_MODE_CPOL | SPI_MODE_LOOP |
-	SPI_MODE_CPHA | SPI_WORD_SET(8) | SPI_LINES_SINGLE,
-	.slave = 0,
-	.cs = NULL,
-};
-
-
+#if 0
 void main(void)
 {
-	const struct device *spi;
-	struct spi_buf tx_bufs[2];
+  int ret;
+  int i, n;
+  int mode = 0, lastn;
+  size_t keylen = 256 / 8;
+  char *p;
+  unsigned char IV[16];
+  unsigned char key[256 / 8];
+  unsigned char digest[32];
+  unsigned char buffer[64];
+  unsigned char diff;
+  char initphrase[16];
+  char *mem_ptr = NULL;
+  
+  mbedtls_aes_context aes_ctx;
+  mbedtls_md_context_t sha_ctx;
+  
+  long message_size, max_message_size = 1024, offset;
+  
+  mbedtls_aes_init(&aes_ctx);
+  mbedtls_md_init(&sha_ctx);
+  
+  ret = mbedtls_md_setup(&sha_ctx,
+                         mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+                         1);
+  
+  if ( ret != 0 ) {
+    printf("  ! mbedtls_md_setup() returned -0x%04x\n", -ret);
+    goto exit;
+  }
+ 
+  memset(message, 0, sizeof(message));
+  memset(initphrase, 0, sizeof(initphrase));
+  memset(IV, 0, sizeof(IV));
+  memset(key, 0, sizeof(key));
+  memset(digest, 0, sizeof(digest));
+  memset(buffer, 0, sizeof(buffer)); 
+  
+  hextext2bin((uint8_t *) key, 256 / 8, key256bits);
+  printf("\nWelcome to AESCRYPT.\n");
+	console_init();
+	max_message_size = 1024;
+	printf("Thanks. Please type a short phrase to be used as input to "
+	     "generate the initial vector of the encryption: \n");
 
-	const struct spi_buf_set tx = {
-		.buffers = tx_bufs,
-		.count = TOTAL_TX_COUNT
-	};	
-	
-	tx_bufs[0].buf = buffer_tx;
-	tx_bufs[0].len = BUF_SIZE;
-
-	tx_bufs[1].buf = buffer2_tx;
-	tx_bufs[1].len = BUF2_SIZE;
-
-	struct spi_buf rx_bufs[2];	
-	const struct spi_buf_set rx = {
-		.buffers = rx_bufs,
-		.count = TOTAL_RX_COUNT
-	};
-	rx_bufs[0].buf = buffer_rx;
-	rx_bufs[0].len = BUF_SIZE;
-
-	rx_bufs[1].buf = buffer2_rx;
-	rx_bufs[1].len = BUF2_SIZE;
-	
-	spi = DEVICE_DT_GET(SPI_DRV_NAME);
-	if (!spi) {
-		//LOG_ERR("Cannot find %s!\n", SPI_DRV_NAME);
-		//zassert_not_null(spi, "Invalid SPI device");
-		return;
-	}
-
-	spi_transceive(spi, &spi_cfg, &tx, &rx);
-	
-	printk("tx buffer is\n");
-	for(int i = 0;i < BUF_SIZE; i++)
+	p = initphrase;
+	while ((13 != n) && (p - initphrase < (int)(sizeof(initphrase) - 1)))
 	{
-		printk("%c ", buffer_tx[i]);
-	}
-	printk("\n");
-	printk("rx buffer is\n");
-	for(int i = 0;i < BUF_SIZE; i++)
-	{
-		printk("%c ", buffer_rx[i]);
-	}
-	printk("\n");
-	
-	printk("tx2 buffer is\n");
-	for(int i = 0;i < BUF2_SIZE; i++)
-	{
-		printk("%c ", buffer2_tx[i]);
-	}
-	printk("\n");
-	printk("rx2 buffer is\n");
-	for(int i = 0;i < BUF2_SIZE; i++)
-	{
-		printk("%c ", buffer2_rx[i]);
-	}
-	printk("\n");
-	
-	while(1);
+	  n = console_getchar();
+	  if (n > 0) 
+	  {
+	    // Local echo
+	    putchar(n);
+	    *p++ = (unsigned char) n;
+	  }
+	} 
+      printf("\nThanks. Please send a message to be encrypted, "
+             "terminated by hitting <enter>, i.e. a newline "
+             "character. The ciphertext will be printed in the following "
+             "format:\n");
+             
+       printf("Initial Vector(16 bytes) | Ciphertext | "
+         "Message Digest Tag(32 bytes)\n");
+  p = message;//inst 1
+  message_size = 0;
+  
+  while ( message_size < max_message_size ) 
+  {
+    n = console_getchar();
+    if (13 == n) {    // newline marks end of message
+      break;
+    }
+    if (n > 0) {
+      *p++ = n;
+      message_size++;
+      // Local echo
+      putchar(n);
+    }
+  }  
+  
+  printf("\n");
+  
+  char hexbuf[2 * TAG_SIZE + 1];
+  
+    for ( i = 0; i < 8; i++ ) {//inst 2
+      buffer[i] = (unsigned char)(message_size >> (i << 3) );
+    }
+    
+  p = initphrase;
+  
+    mbedtls_md_starts(&sha_ctx);//inst 3
+    mbedtls_md_update(&sha_ctx, buffer, 8);
+    mbedtls_md_update(&sha_ctx, (unsigned char*)p, strlen(initphrase) );
+    mbedtls_md_finish(&sha_ctx, digest);
+    
+    memcpy(IV, digest, sizeof(IV) );
+    
+    // The last four bits in the IV are actually used
+    // to store the file size modulo the AES block size.
+    lastn = (int)(message_size & 0x0F);
+
+    IV[15] = (unsigned char) ( (IV[15] & 0xF0) | lastn);
+    
+    // Append the IV at the beginning of the output.
+    bin2hextext(hexbuf, IV, sizeof(IV) );//inst 4
+    printf(hexbuf);//hexbuf_inst 1
+    
+    // Hash the IV and the secret key together 8192 times
+    // using the result to setup the AES context and HMAC.
+    memset(digest, 0, sizeof(digest) );
+    memcpy(digest, IV, IV_SIZE);//digest 1
+
+    for ( i = 0; i < 8192; i++ ) {
+      mbedtls_md_starts(&sha_ctx);
+      mbedtls_md_update(&sha_ctx, digest, TAG_SIZE);
+      mbedtls_md_update(&sha_ctx, key, keylen);
+      mbedtls_md_finish(&sha_ctx, digest);
+    }
+    
+    memset(key, 0, sizeof(key) );
+    mbedtls_aes_setkey_enc(&aes_ctx, digest, 256);//digest 2
+    mbedtls_md_hmac_starts(&sha_ctx, digest, TAG_SIZE);
+    
+    // Encrypt and write the ciphertext.
+    for ( p = message, offset = 0;//inst 5
+          offset < message_size;
+          offset += AES_BLOCK_SIZE, p += AES_BLOCK_SIZE ) {
+      n = (message_size - offset > AES_BLOCK_SIZE)
+          ? AES_BLOCK_SIZE : (int) (message_size - offset);
+
+      memset(buffer, 0, AES_BLOCK_SIZE);
+      memcpy(buffer, p, n);
+      
+      for ( i = 0; i < AES_BLOCK_SIZE; i++ ) {
+        buffer[i] = (unsigned char)(buffer[i] ^ IV[i]);
+      }
+
+      mbedtls_aes_crypt_ecb(&aes_ctx, MBEDTLS_AES_ENCRYPT, buffer, buffer);//inst 6
+
+      mbedtls_md_hmac_update(&sha_ctx, buffer, AES_BLOCK_SIZE);//inst 7
+
+      bin2hextext(hexbuf, buffer, AES_BLOCK_SIZE);
+      printf(hexbuf);//hexbuf_inst 2
+
+      memcpy(IV, buffer, AES_BLOCK_SIZE);
+    }
+    
+    // Finally write the HMAC.
+    mbedtls_md_hmac_finish(&sha_ctx, digest);//digest 3
+
+    bin2hextext(hexbuf, digest, TAG_SIZE);//digest 4
+    printf("%s\n\n", hexbuf);//hexbuf_inst 3
+   
+  exit:
+  memset(buffer, 0, sizeof(buffer) );
+  memset(digest, 0, sizeof(digest) );
+
+  mbedtls_aes_free(&aes_ctx);
+  mbedtls_md_free(&sha_ctx);
+  
+  while(1);
 }
+
+#endif
+
+
+int main(void)
+{
+	console_init();
+	while(1)
+	{
+		app_aescrypt_process_action();
+	}
+}
+
+void app_aescrypt_process_action(void)
+{
+  int ret;
+  int i, n;
+  int mode = 0, lastn;
+  size_t keylen = 256 / 8;
+  char *p;
+  unsigned char IV[AES_BLOCK_SIZE];
+  unsigned char key[256 / 8];
+  unsigned char digest[32];
+  unsigned char buffer[64];
+  unsigned char diff;
+  char initphrase[16];
+
+  mbedtls_aes_context aes_ctx;
+  mbedtls_md_context_t sha_ctx;
+
+  long message_size, max_message_size, offset;
+
+  mbedtls_aes_init(&aes_ctx);
+  mbedtls_md_init(&sha_ctx);
+
+  ret = mbedtls_md_setup(&sha_ctx,
+                         mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+                         1);
+  if ( ret != 0 ) {
+    printf("  ! mbedtls_md_setup() returned -0x%04x\n", -ret);
+    goto exit;
+  }
+
+  memset(message, 0, sizeof(message));
+  memset(initphrase, 0, sizeof(initphrase));
+  memset(IV, 0, sizeof(IV));
+  memset(key, 0, sizeof(key));
+  memset(digest, 0, sizeof(digest));
+  memset(buffer, 0, sizeof(buffer));
+
+  hextext2bin((uint8_t *) key, 256 / 8, key256bits);
+
+  printf("\nWelcome to AESCRYPT.\n");
+  n = 1;
+  while (0 == mode) {
+    if (n > 0) {
+      printf("Please type 'e' to encrypt or 'd' to decrypt: \n");
+    }
+    n = console_getchar();
+    if ('e' == n) {
+      mode = MODE_ENCRYPT;
+      max_message_size = MAX_MESSAGE_SIZE_ENCRYPTION;
+
+      printf("Thanks. Please type a short phrase to be used as input to "
+             "generate the initial vector of the encryption: ");
+      p = initphrase;
+
+      while ((13 != n)
+             && (p - initphrase < (int)(sizeof(initphrase) - 1))) {
+        n = console_getchar();
+        if (n > 0) {
+          // Local echo
+          putchar(n);
+          *p++ = (unsigned char) n;
+        }
+      }
+      printf("\nThanks. Please send a message to be encrypted, "
+             "terminated by hitting <enter>, i.e. a newline "
+             "character. The ciphertext will be printed in the following "
+             "format:\n");//inst 1
+      // Make sure n is not 'd'
+      n = 'e';
+    }
+    if ('d' == n) {
+      mode = MODE_DECRYPT;
+      max_message_size = MAX_MESSAGE_SIZE_DECRYPTION;
+
+      printf("Thanks. Please send the message (ciphertext) to be "
+             "decrypted. The format must be:\n");
+    }
+  }
+
+  printf("Initial Vector(16 bytes) | Ciphertext | "
+         "Message Digest Tag(32 bytes)\n");
+
+  p = message;
+  message_size = 0;
+
+  while ( message_size < max_message_size ) {
+    n = console_getchar();
+    if (13 == n) {    // newline marks end of message
+      break;
+    }
+    if (n > 0) {
+      *p++ = n;
+      message_size++;
+      // Local echo
+      putchar(n);
+    }
+  }
+
+  // Newline after plain text message input, and ciphertext.
+  printf("\n");
+
+  if ( mode == MODE_ENCRYPT ) {//inst 2
+    char hexbuf[2 * TAG_SIZE + 1];
+
+    // Generate the initialization vector as:
+    // IV = SHA-256( message_size || initphrase )[0..15]
+    for ( i = 0; i < 8; i++ ) {
+      buffer[i] = (unsigned char)(message_size >> (i << 3) );
+    }//buffer[0] = 12
+
+    p = initphrase;
+
+    mbedtls_md_starts(&sha_ctx);//inst 3
+    mbedtls_md_update(&sha_ctx, buffer, 8);
+    mbedtls_md_update(&sha_ctx, (unsigned char*)p, strlen(initphrase) );
+    mbedtls_md_finish(&sha_ctx, digest);
+
+    memcpy(IV, digest, sizeof(IV) );
+
+    // The last four bits in the IV are actually used
+    // to store the file size modulo the AES block size.
+    lastn = (int)(message_size & 0x0F);
+
+    IV[15] = (unsigned char) ( (IV[15] & 0xF0) | lastn);
+
+    // Append the IV at the beginning of the output.
+    bin2hextext(hexbuf, IV, sizeof(IV) );//inst 4
+    printf(hexbuf);//hexbuf_inst 1
+
+    // Hash the IV and the secret key together 8192 times
+    // using the result to setup the AES context and HMAC.
+    memset(digest, 0, sizeof(digest) );
+    memcpy(digest, IV, IV_SIZE);//digest 1
+
+    for ( i = 0; i < 8192; i++ ) {
+      mbedtls_md_starts(&sha_ctx);
+      mbedtls_md_update(&sha_ctx, digest, TAG_SIZE);
+      mbedtls_md_update(&sha_ctx, key, keylen);
+      mbedtls_md_finish(&sha_ctx, digest);
+    }
+
+    memset(key, 0, sizeof(key) );
+    mbedtls_aes_setkey_enc(&aes_ctx, digest, 256);//digest 2
+    mbedtls_md_hmac_starts(&sha_ctx, digest, TAG_SIZE);
+
+    // Encrypt and write the ciphertext.
+    for ( p = message, offset = 0;//inst 5
+          offset < message_size;
+          offset += AES_BLOCK_SIZE, p += AES_BLOCK_SIZE ) {
+      n = (message_size - offset > AES_BLOCK_SIZE)
+          ? AES_BLOCK_SIZE : (int) (message_size - offset);
+
+      memset(buffer, 0, AES_BLOCK_SIZE);
+      memcpy(buffer, p, n);
+
+      for ( i = 0; i < AES_BLOCK_SIZE; i++ ) {
+        buffer[i] = (unsigned char)(buffer[i] ^ IV[i]);
+      }
+
+      mbedtls_aes_crypt_ecb(&aes_ctx, MBEDTLS_AES_ENCRYPT, buffer, buffer);//inst 6
+
+      mbedtls_md_hmac_update(&sha_ctx, buffer, AES_BLOCK_SIZE);//inst 7
+
+      bin2hextext(hexbuf, buffer, AES_BLOCK_SIZE);
+      printf(hexbuf);//inst 8 //hexbuf_inst 2
+
+      memcpy(IV, buffer, AES_BLOCK_SIZE);
+    }
+
+    // Finally write the HMAC.
+    mbedtls_md_hmac_finish(&sha_ctx, digest);//digest 3
+
+    bin2hextext(hexbuf, digest, TAG_SIZE);//digest 4
+    printf("%s\n\n", hexbuf);//hexbuf_inst 3
+  }
+
+  if ( mode == MODE_DECRYPT ) {
+    unsigned char tmp[AES_BLOCK_SIZE];
+
+    //  The encrypted file must be structured as follows:
+    //
+    //       00 .. 15              Initialization Vector
+    //       16 .. 31              AES Encrypted Block #1
+    //          ..
+    //     N*16 .. (N+1)*16 - 1    AES Encrypted Block #N
+    // (N+1)*16 .. (N+1)*16 + 32   HMAC-SHA-256(ciphertext)
+    if ( message_size <  (2 * IV_SIZE + 2 * TAG_SIZE) ) {
+      printf("File too short to be decrypted.\n");
+      goto exit;
+    }
+
+    if ( (message_size & 0x0F) != 0 ) {
+      printf("File size not a multiple of 16.\n");
+      goto exit;
+    }
+
+    // Subtract the IV + HMAC length.
+    message_size -= (2 * IV_SIZE + 2 * TAG_SIZE);
+
+    //  Read the IV and original message_size modulo 16.
+    hextext2bin(IV, IV_SIZE, message);
+    lastn = IV[15] & 0x0F;
+
+    // Hash the IV and the secret key together 8192 times
+    // using the result to setup the AES context and HMAC.
+    memset(digest, 0, TAG_SIZE);
+    memcpy(digest, IV, IV_SIZE);
+
+    for ( i = 0; i < 8192; i++ ) {
+      mbedtls_md_starts(&sha_ctx);
+      mbedtls_md_update(&sha_ctx, digest, TAG_SIZE);
+      mbedtls_md_update(&sha_ctx, key, keylen);
+      mbedtls_md_finish(&sha_ctx, digest);
+    }
+
+    memset(key, 0, sizeof(key) );
+    mbedtls_aes_setkey_dec(&aes_ctx, digest, 256);
+    mbedtls_md_hmac_starts(&sha_ctx, digest, TAG_SIZE);
+
+    // Decrypt ciphertext and write the plaintext.
+    for ( p = &message[2 * IV_SIZE], offset = 0;
+          offset < message_size;
+          offset += 2 * AES_BLOCK_SIZE, p += 2 * AES_BLOCK_SIZE ) {
+      hextext2bin(buffer, AES_BLOCK_SIZE, p);
+
+      memcpy(tmp, buffer, AES_BLOCK_SIZE);
+
+      mbedtls_md_hmac_update(&sha_ctx, buffer, AES_BLOCK_SIZE);
+      mbedtls_aes_crypt_ecb(&aes_ctx, MBEDTLS_AES_DECRYPT, buffer, buffer);
+
+      for ( i = 0; i < AES_BLOCK_SIZE; i++ ) {
+        buffer[i] = (unsigned char)(buffer[i] ^ IV[i]);
+      }
+
+      memcpy(IV, tmp, AES_BLOCK_SIZE);
+
+      n = (lastn > 0 && offset == message_size - 2 * AES_BLOCK_SIZE)
+          ? lastn : AES_BLOCK_SIZE;
+
+      buffer[n] = 0;
+      printf( (char*) buffer);
+    }
+
+    // Newline after printing plaintext.
+    printf("\n");
+
+    // Verify the message authentication code.
+    mbedtls_md_hmac_finish(&sha_ctx, digest);
+
+    hextext2bin(buffer, TAG_SIZE, p);
+
+    // Use constant-time buffer comparison
+    diff = 0;
+    for ( i = 0; i < TAG_SIZE; i++ ) {
+      diff |= digest[i] ^ buffer[i];
+    }
+
+    if ( diff != 0 ) {
+      printf("HMAC check failed: wrong key, "
+                     "or file corrupted.\n");
+      goto exit;
+    } else {
+      printf("Message digest tag OK.\n");
+    }
+  }
+  ret = 0;
+
+  exit:
+  memset(buffer, 0, sizeof(buffer) );
+  memset(digest, 0, sizeof(digest) );
+
+  mbedtls_aes_free(&aes_ctx);
+  mbedtls_md_free(&sha_ctx);
+  while(1);
+}
+
+int hextext2bin(uint8_t *binbuf, unsigned int binbuflen, const char *hexstr)
+{
+  uint32_t ret = 0;
+  int      i;
+  uint8_t  tmp;
+  uint8_t  val;
+
+  while (ret < binbuflen) {
+    val = 0;
+    for (i = 1; i >= 0; i--) {
+      tmp = *(hexstr++);
+      // Skip spaces
+      while (tmp == ' ') {
+        tmp = *(hexstr++);
+      }
+      // Reached end of string?
+      if (!tmp) {
+        goto done;
+      }
+
+      if (tmp > '9') {
+        // Ensure uppercase hex
+        tmp &= ~0x20;
+
+        val |= ((tmp - 'A') + 10) << (4 * i);
+      } else {
+        val |= (tmp - '0') << (4 * i);
+      }
+    }
+    *(binbuf++) = val;
+    ret++;
+  }
+  done:
+  return ret;
+}
+
+/***************************************************************************//**
+ * @brief Convert binary data to ascii hexadecimal text string
+ ******************************************************************************/
+void bin2hextext(char* hexstr, uint8_t* binbuf, unsigned int binbuflen)
+{
+  uint32_t i;
+  uint8_t nibble;
+
+  for (i = 0; i < binbuflen; i++) {
+    nibble = (binbuf[i] >> 4) & 0xF;
+    *hexstr++ = nibble > 9 ? nibble - 10 + 'A' : nibble + '0';
+    nibble = (binbuf[i] >> 0) & 0xF;
+    *hexstr++ = nibble > 9 ? nibble - 10 + 'A' : nibble + '0';
+  }
+  // Null terminate at end of string.
+  *hexstr = 0;
+}
+
