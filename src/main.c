@@ -14,14 +14,19 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/shell/shell.h>
 #include <zephyr/drivers/flash.h>
+#include <zephyr/console/console.h>
 #include <zephyr/device.h>
 #include <soc.h>
 #include <stdlib.h>
-#include "md.h"
-#include "aes.h"
+#include "mbedtls/md.h"
+#include "mbedtls/aes.h"
 #include "aes_alt.h"
 #include "mbedtls_config_autogen.h"
 #include "sl_malloc.h"
+#include "sl_se_manager.h"
+
+//#define DEBUG_DIGEST1
+//#define DEBUG_DIGEST2
 
 #define MODE_ENCRYPT                   (1)
 #define MODE_DECRYPT                   (2)
@@ -42,173 +47,18 @@ int hextext2bin(uint8_t *binbuf, unsigned int binbuflen, const char *hexstr);
 void bin2hextext(char* hexstr, uint8_t* binbuf, unsigned int binbuflen);
 void app_aescrypt_process_action(void);
 
-#if 0
-void main(void)
+#ifdef DEBUG_DIGEST1
+void printDigest(unsigned char *arr)
 {
-  int ret;
-  int i, n;
-  int mode = 0, lastn;
-  size_t keylen = 256 / 8;
-  char *p;
-  unsigned char IV[16];
-  unsigned char key[256 / 8];
-  unsigned char digest[32];
-  unsigned char buffer[64];
-  unsigned char diff;
-  char initphrase[16];
-  char *mem_ptr = NULL;
-  
-  mbedtls_aes_context aes_ctx;
-  mbedtls_md_context_t sha_ctx;
-  
-  long message_size, max_message_size = 1024, offset;
-  
-  mbedtls_aes_init(&aes_ctx);
-  mbedtls_md_init(&sha_ctx);
-  
-  ret = mbedtls_md_setup(&sha_ctx,
-                         mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
-                         1);
-  
-  if ( ret != 0 ) {
-    printf("  ! mbedtls_md_setup() returned -0x%04x\n", -ret);
-    goto exit;
-  }
- 
-  memset(message, 0, sizeof(message));
-  memset(initphrase, 0, sizeof(initphrase));
-  memset(IV, 0, sizeof(IV));
-  memset(key, 0, sizeof(key));
-  memset(digest, 0, sizeof(digest));
-  memset(buffer, 0, sizeof(buffer)); 
-  
-  hextext2bin((uint8_t *) key, 256 / 8, key256bits);
-  printf("\nWelcome to AESCRYPT.\n");
-	console_init();
-	max_message_size = 1024;
-	printf("Thanks. Please type a short phrase to be used as input to "
-	     "generate the initial vector of the encryption: \n");
-
-	p = initphrase;
-	while ((13 != n) && (p - initphrase < (int)(sizeof(initphrase) - 1)))
-	{
-	  n = console_getchar();
-	  if (n > 0) 
-	  {
-	    // Local echo
-	    putchar(n);
-	    *p++ = (unsigned char) n;
-	  }
-	} 
-      printf("\nThanks. Please send a message to be encrypted, "
-             "terminated by hitting <enter>, i.e. a newline "
-             "character. The ciphertext will be printed in the following "
-             "format:\n");
-             
-       printf("Initial Vector(16 bytes) | Ciphertext | "
-         "Message Digest Tag(32 bytes)\n");
-  p = message;//inst 1
-  message_size = 0;
-  
-  while ( message_size < max_message_size ) 
-  {
-    n = console_getchar();
-    if (13 == n) {    // newline marks end of message
-      break;
+  int i=0;
+  printf("Digest: ");
+  for(i = 0;i < 32;i++)
+    {
+      printf("%d ",arr[i]);
     }
-    if (n > 0) {
-      *p++ = n;
-      message_size++;
-      // Local echo
-      putchar(n);
-    }
-  }  
-  
   printf("\n");
-  
-  char hexbuf[2 * TAG_SIZE + 1];
-  
-    for ( i = 0; i < 8; i++ ) {//inst 2
-      buffer[i] = (unsigned char)(message_size >> (i << 3) );
-    }
-    
-  p = initphrase;
-  
-    mbedtls_md_starts(&sha_ctx);//inst 3
-    mbedtls_md_update(&sha_ctx, buffer, 8);
-    mbedtls_md_update(&sha_ctx, (unsigned char*)p, strlen(initphrase) );
-    mbedtls_md_finish(&sha_ctx, digest);
-    
-    memcpy(IV, digest, sizeof(IV) );
-    
-    // The last four bits in the IV are actually used
-    // to store the file size modulo the AES block size.
-    lastn = (int)(message_size & 0x0F);
-
-    IV[15] = (unsigned char) ( (IV[15] & 0xF0) | lastn);
-    
-    // Append the IV at the beginning of the output.
-    bin2hextext(hexbuf, IV, sizeof(IV) );//inst 4
-    printf(hexbuf);//hexbuf_inst 1
-    
-    // Hash the IV and the secret key together 8192 times
-    // using the result to setup the AES context and HMAC.
-    memset(digest, 0, sizeof(digest) );
-    memcpy(digest, IV, IV_SIZE);//digest 1
-
-    for ( i = 0; i < 8192; i++ ) {
-      mbedtls_md_starts(&sha_ctx);
-      mbedtls_md_update(&sha_ctx, digest, TAG_SIZE);
-      mbedtls_md_update(&sha_ctx, key, keylen);
-      mbedtls_md_finish(&sha_ctx, digest);
-    }
-    
-    memset(key, 0, sizeof(key) );
-    mbedtls_aes_setkey_enc(&aes_ctx, digest, 256);//digest 2
-    mbedtls_md_hmac_starts(&sha_ctx, digest, TAG_SIZE);
-    
-    // Encrypt and write the ciphertext.
-    for ( p = message, offset = 0;//inst 5
-          offset < message_size;
-          offset += AES_BLOCK_SIZE, p += AES_BLOCK_SIZE ) {
-      n = (message_size - offset > AES_BLOCK_SIZE)
-          ? AES_BLOCK_SIZE : (int) (message_size - offset);
-
-      memset(buffer, 0, AES_BLOCK_SIZE);
-      memcpy(buffer, p, n);
-      
-      for ( i = 0; i < AES_BLOCK_SIZE; i++ ) {
-        buffer[i] = (unsigned char)(buffer[i] ^ IV[i]);
-      }
-
-      mbedtls_aes_crypt_ecb(&aes_ctx, MBEDTLS_AES_ENCRYPT, buffer, buffer);//inst 6
-
-      mbedtls_md_hmac_update(&sha_ctx, buffer, AES_BLOCK_SIZE);//inst 7
-
-      bin2hextext(hexbuf, buffer, AES_BLOCK_SIZE);
-      printf(hexbuf);//hexbuf_inst 2
-
-      memcpy(IV, buffer, AES_BLOCK_SIZE);
-    }
-    
-    // Finally write the HMAC.
-    mbedtls_md_hmac_finish(&sha_ctx, digest);//digest 3
-
-    bin2hextext(hexbuf, digest, TAG_SIZE);//digest 4
-    printf("%s\n\n", hexbuf);//hexbuf_inst 3
-   
-  exit:
-  memset(buffer, 0, sizeof(buffer) );
-  memset(digest, 0, sizeof(digest) );
-
-  mbedtls_aes_free(&aes_ctx);
-  mbedtls_md_free(&sha_ctx);
-  
-  while(1);
 }
-
 #endif
-
 
 int main(void)
 {
@@ -232,7 +82,6 @@ void app_aescrypt_process_action(void)
   unsigned char buffer[64];
   unsigned char diff;
   char initphrase[16];
-
   mbedtls_aes_context aes_ctx;
   mbedtls_md_context_t sha_ctx;
 
@@ -255,7 +104,10 @@ void app_aescrypt_process_action(void)
   memset(key, 0, sizeof(key));
   memset(digest, 0, sizeof(digest));
   memset(buffer, 0, sizeof(buffer));
-
+#ifdef DEBUG_DIGEST1
+    printDigest(digest);
+    printf("inst 1\n");
+#endif
   hextext2bin((uint8_t *) key, 256 / 8, key256bits);
 
   printf("\nWelcome to AESCRYPT.\n");
@@ -335,9 +187,15 @@ void app_aescrypt_process_action(void)
     mbedtls_md_update(&sha_ctx, buffer, 8);
     mbedtls_md_update(&sha_ctx, (unsigned char*)p, strlen(initphrase) );
     mbedtls_md_finish(&sha_ctx, digest);
-
+#ifdef DEBUG_DIGEST1
+    printDigest(digest);
+    printf("inst 2\n");
+#endif
     memcpy(IV, digest, sizeof(IV) );
-
+#ifdef DEBUG_DIGEST1
+    printDigest(digest);
+    printf("inst 3\n");
+#endif
     // The last four bits in the IV are actually used
     // to store the file size modulo the AES block size.
     lastn = (int)(message_size & 0x0F);
@@ -346,12 +204,20 @@ void app_aescrypt_process_action(void)
 
     // Append the IV at the beginning of the output.
     bin2hextext(hexbuf, IV, sizeof(IV) );//inst 4
-    printf(hexbuf);//hexbuf_inst 1
+    printf("%s",hexbuf);//hexbuf_inst 1
 
     // Hash the IV and the secret key together 8192 times
     // using the result to setup the AES context and HMAC.
     memset(digest, 0, sizeof(digest) );
+#ifdef DEBUG_DIGEST1
+    printDigest(digest);
+    printf("inst 4\n");
+#endif
     memcpy(digest, IV, IV_SIZE);//digest 1
+#ifdef DEBUG_DIGEST1
+    printDigest(digest);
+    printf("inst 5\n");
+#endif
 
     for ( i = 0; i < 8192; i++ ) {
       mbedtls_md_starts(&sha_ctx);
@@ -359,11 +225,22 @@ void app_aescrypt_process_action(void)
       mbedtls_md_update(&sha_ctx, key, keylen);
       mbedtls_md_finish(&sha_ctx, digest);
     }
+#ifdef DEBUG_DIGEST1
+    printDigest(digest);
+    printf("inst 6\n");
+#endif
 
     memset(key, 0, sizeof(key) );
     mbedtls_aes_setkey_enc(&aes_ctx, digest, 256);//digest 2
+#ifdef DEBUG_DIGEST1
+    printDigest(digest);
+    printf("inst 7\n");
+#endif
     mbedtls_md_hmac_starts(&sha_ctx, digest, TAG_SIZE);
-
+#ifdef DEBUG_DIGEST1
+    printDigest(digest);
+    printf("inst 8\n");
+#endif
     // Encrypt and write the ciphertext.
     for ( p = message, offset = 0;//inst 5
           offset < message_size;
@@ -383,15 +260,30 @@ void app_aescrypt_process_action(void)
       mbedtls_md_hmac_update(&sha_ctx, buffer, AES_BLOCK_SIZE);//inst 7
 
       bin2hextext(hexbuf, buffer, AES_BLOCK_SIZE);
-      printf(hexbuf);//inst 8 //hexbuf_inst 2
+      printf("%s",hexbuf);//inst 8 //hexbuf_inst 2
 
       memcpy(IV, buffer, AES_BLOCK_SIZE);
     }
 
+#ifdef DEBUG_DIGEST2
+    printDigest(digest);
+    printf("inst 1\n");
+#endif
     // Finally write the HMAC.
     mbedtls_md_hmac_finish(&sha_ctx, digest);//digest 3
-
+#ifdef DEBUG_DIGEST2
+    printDigest(digest);
+    printf("inst 2\n");
+#endif
+#ifdef DEBUG_DIGEST1
+    printDigest(digest);
+    printf("inst 9\n");
+#endif
     bin2hextext(hexbuf, digest, TAG_SIZE);//digest 4
+#ifdef DEBUG_DIGEST1
+    printDigest(digest);
+    printf("inst 10\n");
+#endif
     printf("%s\n\n", hexbuf);//hexbuf_inst 3
   }
 
@@ -459,7 +351,7 @@ void app_aescrypt_process_action(void)
           ? lastn : AES_BLOCK_SIZE;
 
       buffer[n] = 0;
-      printf( (char*) buffer);
+      printf("%s", (char*) buffer);
     }
 
     // Newline after printing plaintext.
